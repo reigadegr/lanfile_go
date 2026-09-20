@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"time"
 
 	"github.com/gofiber/fiber/v3"
 )
@@ -19,17 +18,17 @@ func main() {
 		root, err = filepath.EvalSymlinks(root)
 	}
 	if err != nil {
-		logf("ERROR 无法访问目录 %q: %v", dir, err)
+		logfSync("ERROR 无法访问目录 %q: %v", dir, err)
 		os.Exit(1)
 	}
 
-	logf("INFO serving %s on http://0.0.0.0:%d", root, port)
+	logfSync("INFO serving %s on http://0.0.0.0:%d", root, port)
 	err = newApp(root, port).Listen(
 		fmt.Sprintf(":%d", port),
 		fiber.ListenConfig{DisableStartupMessage: true},
 	)
 	if err != nil {
-		logf("ERROR %v", err)
+		logfSync("ERROR %v", err)
 		os.Exit(1)
 	}
 }
@@ -46,10 +45,4 @@ func parseArgs(args []string) (uint16, string) {
 		}
 	}
 	return port, dir
-}
-
-// logf 按 "2026-01-01 12:00:00 LEVEL msg" 的格式往 stdout 写一行日志。
-func logf(format string, args ...any) {
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	fmt.Fprintf(os.Stdout, "%s %s\n", timestamp, fmt.Sprintf(format, args...))
 }

@@ -11,7 +11,7 @@ import (
 )
 
 func registerFiles(app *fiber.App, root string) {
-	cache := newFileCache(root)
+	cache := newFileCache()
 	app.Get("/files/*", func(c fiber.Ctx) error {
 		return serveFile(c, root, wildcard(c), cache)
 	})
@@ -40,27 +40,6 @@ func serveFile(c fiber.Ctx, root, sub string, cache *fileCache) error {
 	}
 
 	joined := filepath.Join(root, filepath.FromSlash(sub))
-
-	// 快路径：openat2 一次系统调用就完成「打开 + 越界检查 + 拒绝符号链接」，
-	// 省掉未命中时的 Lstat 与 EvalSymlinks。只要路径里有符号链接、越出 root、
-	// 文件不存在或内核不支持，就回落到下面改动前就有的路径，响应完全一致。
-	if rel, ok := relWithin(root, joined); ok {
-		if file, ok := openBeneath(cache.rootFd, rel); ok {
-			info, err := file.Stat()
-			if err == nil && !info.Mode().IsRegular() {
-				_ = file.Close()
-				return fiber.ErrNotFound
-			}
-			if err == nil && info.Size() <= maxCachedFileSize {
-				return cache.serve(c, cache.storeOpened(sub, joined, file, info))
-			}
-			_ = file.Close()
-			if err == nil {
-				// 路径不含符号链接，joined 就是规范路径。
-				return sendFile(c, joined)
-			}
-		}
-	}
 
 	info, err := os.Lstat(joined)
 	if err != nil || !info.Mode().IsRegular() {

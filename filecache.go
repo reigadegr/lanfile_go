@@ -71,18 +71,14 @@ type cacheShard struct {
 type fileCache struct {
 	shards [cacheShards]cacheShard
 	dirs   dirCache
-
-	rootDir *os.File // root 目录句柄，openat2 的 dirfd；保持引用以免被 GC 回收
-	rootFd  int      // rootDir 的描述符号；不支持 openat2 时为 -1
 }
 
-func newFileCache(root string) *fileCache {
+func newFileCache() *fileCache {
 	cache := &fileCache{}
 	for i := range cache.shards {
 		cache.shards[i].entries = make(map[string]*cacheEntry, cacheShardSize)
 	}
 	cache.dirs.entries = make(map[string]os.FileInfo, dirCacheSize)
-	cache.rootDir, cache.rootFd = openRoot(root)
 	return cache
 }
 
@@ -170,6 +166,9 @@ func (fc *fileCache) acquire(key string) *cacheEntry {
 
 // release 归还一个引用；条目已被摘除且引用归零时关闭 fd。
 func (fc *fileCache) release(entry *cacheEntry) {
+	if entry == nil {
+		return
+	}
 	shard := fc.shardOf(entry.key)
 	shard.mu.Lock()
 	entry.refs--
@@ -358,7 +357,12 @@ func (b *fileBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// Close 归还引用。io.Closer 允许同一个流被关闭多次，所以第二次必须无害：
+// fasthttp 在正文写完后与响应重置时都可能调用它，重复关闭不能碰到已置空的 entry。
 func (b *fileBody) Close() error {
+	if b.entry == nil {
+		return nil
+	}
 	b.cache.release(b.entry)
 	b.entry = nil
 	return nil

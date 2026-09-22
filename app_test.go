@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -380,6 +381,96 @@ func TestFilesEndpointSendsETagAndHonoursIfNoneMatch(t *testing.T) {
 
 	stale := get(t, app, "/files/hello.txt", map[string]string{"If-None-Match": `"nope"`})
 	requireStatus(t, stale, http.StatusOK)
+}
+
+// ---- Open file cache ----
+
+func TestFilesEndpointRevalidatesOpenFileCache(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "hot.txt", "first version")
+	app := newTestApp(root)
+	path := filepath.Join(root, "hot.txt")
+
+	if got := string(body(t, get(t, app, "/files/hot.txt"))); got != "first version" {
+		t.Fatalf("initial body = %q, want first version", got)
+	}
+
+	// 原地改写（inode 不变）：必须重新打开，否则会按旧长度截断正文
+	writeFile(t, root, "hot.txt", "second")
+	resp := get(t, app, "/files/hot.txt")
+	requireStatus(t, resp, http.StatusOK)
+	if got := string(body(t, resp)); got != "second" {
+		t.Errorf("after rewrite body = %q, want second", got)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "6" {
+		t.Errorf("after rewrite Content-Length = %q, want 6", got)
+	}
+
+	// 只改 mtime（内容与大小都不变）：Last-Modified 也必须跟着变
+	future := time.Now().Add(time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	resp = get(t, app, "/files/hot.txt")
+	requireStatus(t, resp, http.StatusOK)
+	if got := resp.Header.Get("Last-Modified"); got != future.UTC().Format(http.TimeFormat) {
+		t.Errorf("after touch Last-Modified = %q, want %q", got, future.UTC().Format(http.TimeFormat))
+	}
+
+	// 删除后不能再从缓存 fd 提供内容
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	requireStatus(t, get(t, app, "/files/hot.txt"), http.StatusNotFound)
+
+	// 换成目录、换成符号链接同样必须 404
+	writeFile(t, root, "swap.txt", "swap")
+	requireStatus(t, get(t, app, "/files/swap.txt"), http.StatusOK)
+	if err := os.Remove(filepath.Join(root, "swap.txt")); err != nil {
+		t.Fatalf("remove swap: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "swap.txt"), 0o755); err != nil {
+		t.Fatalf("mkdir swap: %v", err)
+	}
+	requireStatus(t, get(t, app, "/files/swap.txt"), http.StatusNotFound)
+}
+
+func TestFilesEndpointServesCachedFileConcurrently(t *testing.T) {
+	root := t.TempDir()
+	content := strings.Repeat("0123456789abcdefghij", 100)
+	writeFile(t, root, "shared.txt", content)
+	app := newTestApp(root)
+
+	// 共享同一个缓存 fd 并发读：必须用带偏移量的读取，否则正文会互相截断
+	const workers = 16
+	failures := make(chan string, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/files/shared.txt", nil)
+			resp, err := app.Test(req, fiber.TestConfig{Timeout: testTimeout, FailOnTimeout: true})
+			if err != nil {
+				failures <- err.Error()
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+			data, err := io.ReadAll(resp.Body)
+			if err != nil {
+				failures <- err.Error()
+				return
+			}
+			if string(data) != content {
+				failures <- fmt.Sprintf("body = %d bytes, want %d", len(data), len(content))
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Error(failure)
+	}
 }
 
 // ---- Real TCP ----

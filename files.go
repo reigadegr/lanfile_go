@@ -5,20 +5,85 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
 )
 
 func registerFiles(app *fiber.App, root string) {
+	cache := newFileCache(root)
 	app.Get("/files/*", func(c fiber.Ctx) error {
-		abs, ok := resolveFile(root, wildcard(c))
+		return serveFile(c, root, wildcard(c), cache)
+	})
+}
+
+// serveFile 是 /files/* 的处理器。
+//
+// 普通请求先拿请求路径查打开文件缓存，命中时只做一次 Lstat 重新校验
+// （inode、大小、mtime 含纳秒全部一致才算命中），然后直接用缓存 fd 构造响应；
+// 未命中才走完整的 resolveFile + open + fstat，并把结果写进缓存。
+func serveFile(c fiber.Ctx, root, sub string, cache *fileCache) error {
+	// Range 请求沿用改动前的实现，206/416/Content-Range/If-None-Match 的组合语义完全不变。
+	if len(c.Request().Header.Peek(fiber.HeaderRange)) > 0 {
+		abs, ok := resolveFile(root, sub)
 		if !ok {
 			return fiber.ErrNotFound
 		}
 		return sendFile(c, abs)
-	})
+	}
+
+	if entry := cache.acquire(sub); entry != nil {
+		if info, err := os.Lstat(entry.joined); err == nil && info.Mode().IsRegular() && entry.matches(info) {
+			return cache.serve(c, entry)
+		}
+		cache.discard(entry)
+	}
+
+	joined := filepath.Join(root, filepath.FromSlash(sub))
+
+	// 快路径：openat2 一次系统调用就完成「打开 + 越界检查 + 拒绝符号链接」，
+	// 省掉未命中时的 Lstat 与 EvalSymlinks。只要路径里有符号链接、越出 root、
+	// 文件不存在或内核不支持，就回落到下面改动前就有的路径，响应完全一致。
+	if rel, ok := relWithin(root, joined); ok {
+		if file, ok := openBeneath(cache.rootFd, rel); ok {
+			info, err := file.Stat()
+			if err == nil && !info.Mode().IsRegular() {
+				_ = file.Close()
+				return fiber.ErrNotFound
+			}
+			if err == nil && info.Size() <= maxCachedFileSize {
+				return cache.serve(c, cache.storeOpened(sub, joined, file, info))
+			}
+			_ = file.Close()
+			if err == nil {
+				// 路径不含符号链接，joined 就是规范路径。
+				return sendFile(c, joined)
+			}
+		}
+	}
+
+	info, err := os.Lstat(joined)
+	if err != nil || !info.Mode().IsRegular() {
+		return fiber.ErrNotFound
+	}
+	dir, canonical, ok := cache.dirs.resolve(root, joined)
+	if !ok {
+		return fiber.ErrNotFound
+	}
+	abs := joined
+	if canonical != dir {
+		abs = canonical + joined[len(dir):]
+	}
+	// 大文件不进缓存（共享 fd 无法安全 sendfile），原样交给框架的开新 fd 路径。
+	if info.Size() > maxCachedFileSize {
+		return sendFile(c, abs)
+	}
+	entry, err := cache.store(sub, joined, abs)
+	if err != nil {
+		// 打不开等情况下仍走原路径，响应与改动前保持一致。
+		return sendFile(c, abs)
+	}
+	return cache.serve(c, entry)
 }
 
 // resolveFile 解析请求路径对应的绝对文件路径，且必须位于 root 之内（防目录穿越）。
@@ -31,6 +96,11 @@ func resolveFile(root, sub string) (string, bool) {
 	if err != nil || !info.Mode().IsRegular() {
 		return "", false
 	}
+	return canonicalPath(root, joined)
+}
+
+// canonicalPath 解析 joined 里的符号链接，并确认解析结果仍在 root 之内。
+func canonicalPath(root, joined string) (string, bool) {
 	canonical, err := filepath.EvalSymlinks(joined)
 	if err != nil || !withinRoot(root, canonical) {
 		return "", false
@@ -72,13 +142,7 @@ func fileETag(abs string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	return `"` + strings.Join(
-		[]string{
-			strconv.FormatInt(info.Size(), 16),
-			strconv.FormatInt(info.ModTime().Unix(), 16),
-			strconv.FormatInt(int64(info.ModTime().Nanosecond()), 16),
-		}, "-",
-	) + `"`, true
+	return etagOf(info), true
 }
 
 // matchesIfNoneMatch 判断 If-None-Match 是否命中当前 ETag（支持 "*"、弱校验前缀与逗号分隔列表）。

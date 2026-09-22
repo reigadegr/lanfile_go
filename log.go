@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,7 +37,27 @@ func logfSync(format string, args ...any) {
 
 // logLine 拼出完整的一行日志（含换行）。
 func logLine(format string, args ...any) string {
-	return time.Now().Format("2006-01-02 15:04:05") + " " + fmt.Sprintf(format, args...) + "\n"
+	return logStamp() + " " + fmt.Sprintf(format, args...) + "\n"
+}
+
+// logStamp 缓存「当前秒」已经格式化好的时间戳：日志按秒计时，同一秒内的所有请求
+// 复用同一个字符串，省掉每请求一次的 time.Time.Format 分配。
+type logStampValue struct {
+	sec  int64
+	text string
+}
+
+var logStampCache atomic.Pointer[logStampValue]
+
+func logStamp() string {
+	now := time.Now()
+	sec := now.Unix()
+	if cached := logStampCache.Load(); cached != nil && cached.sec == sec {
+		return cached.text
+	}
+	text := now.Format("2006-01-02 15:04:05")
+	logStampCache.Store(&logStampValue{sec: sec, text: text})
+	return text
 }
 
 // writeLogs 批量消费日志队列：把当下能取到的行攒成一次写，减少慢终端的系统调用次数。

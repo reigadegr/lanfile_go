@@ -62,9 +62,15 @@ func wildcard(c fiber.Ctx) string {
 
 // withinRoot 判断 path 是否位于 root 之内（按路径分量比较，避免 /srv/wwwroot 误判为 /srv/www 的子路径）。
 func withinRoot(root, path string) bool {
+	_, ok := relWithin(root, path)
+	return ok
+}
+
+// relWithin 返回 path 相对 root 的路径；path 不在 root 之内时返回 false。
+func relWithin(root, path string) (string, bool) {
 	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return false
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
 	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	return filepath.ToSlash(rel), true
 }
